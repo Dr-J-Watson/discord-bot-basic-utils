@@ -100,17 +100,3 @@ Helpers disponibles dans `core/db.py` :
 - `upsert_user(pool, ...)` : Ajoute ou met à jour un utilisateur
 - `bulk_upsert_users(pool, ...)` : Upsert en masse
 Utilisez `await bot.db_pool.fetch(...)` ou créez des helpers. Le pool est initialisé si `DATABASE_URL` est présent.
-
-## Production
-- Fixer une version précise de l'image Python si nécessaire.
-- Utiliser un secret manager pour le token.
-- Ajouter gestion de migrations (ex: Alembic ou simple scripts SQL).
-
-## Prochaines idées
-- Gestion des cogs
-- Logging structuré (JSON)
-- Sentry / OpenTelemetry
-- Tests automatisés
-
-## Licence
-Projet de base libre d'adaptation.
