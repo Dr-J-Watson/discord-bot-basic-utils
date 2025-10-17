@@ -133,6 +133,17 @@ class VoiceHubsManager:
                     speak=None,
                 )
 
+        if not meta.conference_allowed:
+            for target, _ in list(channel.overwrites.items()):
+                if not isinstance(target, discord.Member):
+                    continue
+                if target.id in tracked_ids:
+                    continue
+                try:
+                    await channel.set_permissions(target, overwrite=None, reason=reason)
+                except Exception:  # noqa: BLE001
+                    logger.debug("Impossible de nettoyer les permissions résiduelles pour %s", target.id)
+
     async def transfer_room_ownership(self, meta: RoomMeta, new_owner_id: int, guild: discord.Guild):
         channel = guild.get_channel(meta.channel_id)
         if not isinstance(channel, discord.VoiceChannel):
