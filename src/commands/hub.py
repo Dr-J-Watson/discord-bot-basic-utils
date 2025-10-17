@@ -12,6 +12,7 @@ from core.voice_hubs.manager import VoiceHubsManager
 from db import voice_hubs as db_voice_hubs
 from core.permissions import require_perms, ADMINISTRATOR
 from views import hub as hub_view
+from views.voice_hubs import build_control_view, build_control_embed
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,38 @@ async def hub_config(
     if limit is not None:
         msg_parts.append(f"max_rooms={'illimité' if limit==0 else limit}")
     await interaction.followup.send(hub_view.msg_config_update(msg_parts), ephemeral=True)
+
+
+@hub_group.command(name="panel", description="Recevoir votre panneau de contrôle en lecture seule")
+async def hub_panel(interaction: discord.Interaction):
+    mgr = get_manager(interaction)
+    if not interaction.guild:
+        await interaction.response.send_message("Commande uniquement disponible dans un serveur.", ephemeral=True)
+        return
+
+    member = interaction.guild.get_member(interaction.user.id)
+    if not isinstance(member, discord.Member):
+        await interaction.response.send_message("Impossible de récupérer votre profil membre.", ephemeral=True)
+        return
+
+    voice_state = member.voice
+    if not voice_state or not isinstance(voice_state.channel, discord.VoiceChannel):
+        await interaction.response.send_message("Vous devez être dans votre salon vocal dynamique.", ephemeral=True)
+        return
+
+    channel = voice_state.channel
+    meta = mgr.room_meta.get(channel.id)
+    if not meta:
+        await interaction.response.send_message("Aucun panneau trouvé pour ce salon.", ephemeral=True)
+        return
+
+    if meta.creator_id != member.id:
+        await interaction.response.send_message("Ce salon ne vous appartient pas.", ephemeral=True)
+        return
+
+    embed = build_control_embed(meta, channel, member)
+    view = build_control_view(mgr, meta)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 @hub_create.autocomplete('channel')

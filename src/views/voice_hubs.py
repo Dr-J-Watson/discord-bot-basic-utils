@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 import discord
-from typing import Optional, Iterable, Set
+from typing import Optional, Set
 
 CONTROL_TITLE = "Voice Hub"
 
@@ -14,19 +14,32 @@ def build_control_embed(meta: "RoomMeta", channel: discord.VoiceChannel, creator
     embed = discord.Embed(title=f"Contrôle: {channel.name}", color=discord.Color.blurple())
     creator_name = creator.mention if creator else "?"
     embed.add_field(name="Créateur", value=creator_name, inline=True)
-    embed.add_field(name="Mode", value=meta.mode, inline=True)
+    mode_labels = {
+        "open": "Ouvert",
+        "closed": "Fermé",
+        "private": "Privé",
+        "conference": "Conférence",
+    }
+    embed.add_field(name="Mode", value=mode_labels.get(meta.mode, meta.mode), inline=True)
     wl = ", ".join(f"<@{u}>" for u in list(meta.whitelist)[:8]) or "(vide)"
     bl = ", ".join(f"<@{u}>" for u in list(meta.blacklist)[:8]) or "(vide)"
     embed.add_field(name="Whitelist", value=wl, inline=False)
     embed.add_field(name="Blacklist", value=bl, inline=False)
+    if meta.mode == "conference":
+        allowed_preview = ", ".join(f"<@{u}>" for u in list(meta.conference_allowed)[:8]) or "(aucun)"
+        embed.add_field(name="Conférence", value=allowed_preview, inline=False)
     embed.set_footer(text=f"Channel ID: {channel.id}")
     return embed
 
 
-def build_control_view(manager, meta: "RoomMeta") -> discord.ui.View:
+def build_control_view(manager, meta: "RoomMeta", *, readonly: bool = False) -> discord.ui.View:
     class ControlView(discord.ui.View):
         def __init__(self):
             super().__init__(timeout=None)
+            self.readonly = readonly
+            if self.readonly:
+                for child in self.children:
+                    child.disabled = True
 
         # ---- helpers ----
         @staticmethod
@@ -46,35 +59,22 @@ def build_control_view(manager, meta: "RoomMeta") -> discord.ui.View:
                     pass
             return ids
 
-        async def _apply_permissions(self, rm, guild: discord.Guild):
-            # Applique des overwrites simples: blacklist -> connect=False, whitelist -> connect=True (prioritaire)
-            channel = guild.get_channel(rm.channel_id)
-            if not isinstance(channel, discord.VoiceChannel):
+        async def _apply_permissions(self, rm, guild: Optional[discord.Guild] = None):
+            if guild is None:
+                _, guild = self._resolve_channel_and_guild(rm)
+            if not isinstance(guild, discord.Guild):
                 return
-            # Applique pour chaque utilisateur listé
-            async def set_overwrite(user_id: int, allow_connect: Optional[bool]):
-                member = guild.get_member(user_id)
-                if not isinstance(member, discord.Member):
-                    return
-                current = channel.overwrites_for(member)
-                # On ne touche qu'au flag connect pour éviter les surprises
-                current.connect = allow_connect
-                try:
-                    await channel.set_permissions(member, overwrite=current, reason="Voice hub WL/BL update")
-                except Exception:
-                    pass
+            try:
+                await manager.apply_room_permissions(rm, guild)
+            except Exception:
+                pass
 
-            # Les whitelists prennent le pas (connect True)
-            for uid in list(rm.whitelist):
-                await set_overwrite(uid, True)
-            # Blacklist (connect False), retire des whitelists potentiels
-            for uid in list(rm.blacklist):
-                await set_overwrite(uid, False)
-
-        async def _refresh_panel(self, rm, guild: discord.Guild):
+        async def _refresh_panel(self, rm, guild: Optional[discord.Guild] = None):
             # Récupère le message de contrôle pour le mettre à jour
-            channel = guild.get_channel(rm.channel_id)
-            if not isinstance(channel, discord.VoiceChannel):
+            channel, resolved_guild = self._resolve_channel_and_guild(rm)
+            if isinstance(resolved_guild, discord.Guild):
+                guild = resolved_guild
+            if not isinstance(channel, discord.VoiceChannel) or not isinstance(guild, discord.Guild):
                 return
             creator_member = guild.get_member(rm.creator_id) if rm.creator_id else None
             embed = build_control_embed(rm, channel, creator_member)
@@ -82,7 +82,9 @@ def build_control_view(manager, meta: "RoomMeta") -> discord.ui.View:
             text_channel_id = getattr(rm, "text_channel_id", None)
             message_id = getattr(rm, "control_message_id", None)
             if text_channel_id and message_id:
-                tcand = guild.get_channel(text_channel_id)
+                tcand = manager.bot.get_channel(text_channel_id)
+                if tcand is None and isinstance(guild, discord.Guild):
+                    tcand = guild.get_channel(text_channel_id)
                 # 1) Tente d'éditer le message existant si possible
                 try:
                     if hasattr(tcand, "fetch_message"):
@@ -97,52 +99,139 @@ def build_control_view(manager, meta: "RoomMeta") -> discord.ui.View:
                         new_msg = await tcand.send(embed=embed, view=build_control_view(manager, rm))  # type: ignore[attr-defined]
                         rm.control_message_id = new_msg.id
                         rm.text_channel_id = tcand.id  # type: ignore[assignment]
+                        rm.control_is_dm = isinstance(tcand, discord.DMChannel)
                         return
                 except Exception:
                     pass
 
+        @staticmethod
+        def _resolve_channel_and_guild(rm):
+            channel = manager.bot.get_channel(rm.channel_id)
+            guild = channel.guild if isinstance(channel, discord.VoiceChannel) else None
+            return channel, guild
+
         async def interaction_check(self, interaction: discord.Interaction) -> bool:
-            if interaction.user.guild_permissions.administrator:
-                return True
+            if self.readonly:
+                await interaction.response.send_message("Panneau en lecture seule.", ephemeral=True)
+                return False
             rm = manager.room_meta.get(meta.channel_id)
-            if rm and rm.creator_id == interaction.user.id:
+            if not rm:
+                await interaction.response.send_message("Meta introuvable", ephemeral=True)
+                return False
+            channel, guild = self._resolve_channel_and_guild(rm)
+            if isinstance(guild, discord.Guild):
+                member = guild.get_member(interaction.user.id)
+                if member and member.guild_permissions.administrator:
+                    return True
+            if rm.creator_id == interaction.user.id:
                 return True
             await interaction.response.send_message("Non autorisé.", ephemeral=True)
             return False
 
-        @discord.ui.button(label="Ouvert", style=discord.ButtonStyle.secondary)
+        @discord.ui.button(label="Ouvert", style=discord.ButtonStyle.secondary, row=0)
         async def mode_open(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
             await self._set_mode(interaction, "open")
 
-        @discord.ui.button(label="Fermé", style=discord.ButtonStyle.secondary)
+        @discord.ui.button(label="Fermé", style=discord.ButtonStyle.secondary, row=0)
         async def mode_closed(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
             await self._set_mode(interaction, "closed")
 
-        @discord.ui.button(label="Privé", style=discord.ButtonStyle.secondary)
+        @discord.ui.button(label="Privé", style=discord.ButtonStyle.secondary, row=0)
         async def mode_private(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
             await self._set_mode(interaction, "private")
 
+        @discord.ui.button(label="Conférence", style=discord.ButtonStyle.secondary, row=0)
+        async def mode_conference(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
+            await self._set_mode(interaction, "conference")
+
         # --- Whitelist / Blacklist management ---
-        @discord.ui.button(label="WL +", style=discord.ButtonStyle.success)
+        @discord.ui.button(label="WL +", style=discord.ButtonStyle.success, row=1)
         async def wl_add(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
             await self._open_user_select(interaction, list_type="wl", action="add")
 
-        @discord.ui.button(label="WL -", style=discord.ButtonStyle.secondary)
+        @discord.ui.button(label="WL -", style=discord.ButtonStyle.secondary, row=1)
         async def wl_remove(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
             await self._open_user_select(interaction, list_type="wl", action="remove")
 
-        @discord.ui.button(label="BL +", style=discord.ButtonStyle.danger)
+        @discord.ui.button(label="BL +", style=discord.ButtonStyle.danger, row=1)
         async def bl_add(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
             await self._open_user_select(interaction, list_type="bl", action="add")
 
-        @discord.ui.button(label="BL -", style=discord.ButtonStyle.secondary)
+        @discord.ui.button(label="BL -", style=discord.ButtonStyle.secondary, row=1)
         async def bl_remove(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
             await self._open_user_select(interaction, list_type="bl", action="remove")
 
-        @discord.ui.button(label="Supprimer", style=discord.ButtonStyle.danger)
+        @discord.ui.button(label="Purger", style=discord.ButtonStyle.danger, row=2)
+        async def purge(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
+            rm = manager.room_meta.get(meta.channel_id)
+            if not rm:
+                await interaction.response.send_message("Canal ou métadonnées introuvables", ephemeral=True)
+                return
+            channel, guild = self._resolve_channel_and_guild(rm)
+            if not isinstance(channel, discord.VoiceChannel) or not isinstance(guild, discord.Guild):
+                await interaction.response.send_message("Canal ou métadonnées introuvables", ephemeral=True)
+                return
+            try:
+                await self._apply_permissions(rm, guild)
+            except Exception:
+                pass
+
+            disconnected_users = []
+            try:
+                allowed_ids = {rm.creator_id} | set(rm.whitelist)
+                if rm.mode == "conference":
+                    allowed_ids.update(rm.conference_allowed)
+
+                # Appliquer les règles selon le mode du salon
+                for member in channel.members:
+                    should_disconnect = False
+                    
+                    # Toujours déconnecter les utilisateurs en blacklist
+                    if member.id in rm.blacklist:
+                        should_disconnect = True
+                    
+                    # Modes privés/fermés/conférence -> restreindre aux autorisés
+                    elif rm.mode in {"private", "closed", "conference"} and member.id not in allowed_ids:
+                        should_disconnect = True
+                    
+                    # En mode fermé, déconnecter ceux en blacklist seulement
+                    # (en mode ouvert, seule la blacklist compte)
+                    
+                    if should_disconnect:
+                        try:
+                            await member.move_to(None, reason="Purge - règles du salon appliquées")
+                            disconnected_users.append(member.display_name)
+                        except Exception:  # noqa: BLE001
+                            pass
+                
+                # Message de résultat
+                if disconnected_users:
+                    message = f"Purge effectuée. {len(disconnected_users)} utilisateur(s) déconnecté(s): {', '.join(disconnected_users[:10])}"
+                    if len(disconnected_users) > 10:
+                        message += f" et {len(disconnected_users) - 10} autre(s)"
+                else:
+                    message = "Purge effectuée. Aucun utilisateur à déconnecter."
+                    
+                await interaction.response.send_message(message, ephemeral=True)
+                
+            except Exception:  # noqa: BLE001
+                await interaction.response.send_message("Erreur lors de la purge", ephemeral=True)
+
+        @discord.ui.button(label="Transférer", style=discord.ButtonStyle.primary, row=2)
+        async def transfer(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
+            rm = manager.room_meta.get(meta.channel_id)
+            if not rm:
+                await interaction.response.send_message("Meta introuvable", ephemeral=True)
+                return
+            await self._open_transfer_dialog(interaction, rm)
+
+        @discord.ui.button(label="Supprimer", style=discord.ButtonStyle.danger, row=2)
         async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
             rm = manager.room_meta.get(meta.channel_id)
-            channel = interaction.guild.get_channel(rm.channel_id) if (interaction.guild and rm) else None
+            if not rm:
+                await interaction.response.send_message("Canal introuvable", ephemeral=True)
+                return
+            channel, _ = self._resolve_channel_and_guild(rm)
             if isinstance(channel, discord.VoiceChannel):
                 try:
                     await channel.delete(reason="Delete dynamic room via panel")
@@ -159,20 +248,38 @@ def build_control_view(manager, meta: "RoomMeta") -> discord.ui.View:
             if not rm:
                 await interaction.response.send_message("Meta introuvable", ephemeral=True)
                 return
-            rm.mode = new_mode
-            channel = interaction.guild.get_channel(rm.channel_id) if interaction.guild else None
-            creator_member = channel.guild.get_member(rm.creator_id) if isinstance(channel, discord.VoiceChannel) else None
-            if isinstance(channel, discord.VoiceChannel) and creator_member:
-                new_embed = build_control_embed(rm, channel, creator_member)
-                try:
-                    await interaction.response.edit_message(embed=new_embed, view=self)
-                except Exception:  # noqa: BLE001
-                    try:
-                        await interaction.followup.send("Mode modifié.", ephemeral=True)
-                    except Exception:
-                        pass
-            else:
+            channel, guild = self._resolve_channel_and_guild(rm)
+            if not isinstance(channel, discord.VoiceChannel) or not isinstance(guild, discord.Guild):
                 await interaction.response.send_message("Channel introuvable", ephemeral=True)
+                return
+
+            if new_mode == "conference":
+                rm.conference_allowed = {m.id for m in channel.members}
+                if rm.creator_id:
+                    rm.conference_allowed.add(rm.creator_id)
+            else:
+                rm.conference_allowed.clear()
+
+            rm.mode = new_mode
+
+            try:
+                await manager.apply_room_permissions(rm, guild)
+            except Exception:
+                await interaction.response.send_message("Erreur lors de la mise à jour des permissions", ephemeral=True)
+                return
+
+            creator_member = guild.get_member(rm.creator_id) if rm.creator_id else None
+            new_embed = build_control_embed(rm, channel, creator_member)
+            new_view = build_control_view(manager, rm)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("Mode modifié.", ephemeral=True)
+                else:
+                    await interaction.response.edit_message(embed=new_embed, view=new_view)
+            except Exception:
+                await interaction.followup.send("Mode mis à jour.", ephemeral=True)
+
+            await self._refresh_panel(rm, guild)
 
         async def _open_user_select(self, interaction: discord.Interaction, list_type: str, action: str):
             rm = manager.room_meta.get(meta.channel_id)
@@ -180,11 +287,16 @@ def build_control_view(manager, meta: "RoomMeta") -> discord.ui.View:
                 await interaction.response.send_message("Meta introuvable", ephemeral=True)
                 return
 
+            parent_view = self
+
             class SelectUsersView(discord.ui.View):
                 def __init__(self, *, timeout: Optional[float] = 60):
                     super().__init__(timeout=timeout)
                     self.list_type = list_type
                     self.action = action
+                    ch, g = parent_view._resolve_channel_and_guild(rm)
+                    self.voice_channel = ch if isinstance(ch, discord.VoiceChannel) else None
+                    self.guild = g if isinstance(g, discord.Guild) else None
 
                     # ADD = UserSelect (libre). REMOVE = Select limité aux IDs présents dans la liste courante
                     if self.action == "add":
@@ -211,9 +323,9 @@ def build_control_view(manager, meta: "RoomMeta") -> discord.ui.View:
                                 _rm.blacklist.update(ids)
                                 _rm.whitelist.difference_update(ids)
                             try:
-                                if sel_inter.guild:
-                                    await ControlView._apply_permissions(self, _rm, sel_inter.guild)  # type: ignore[arg-type]
-                                    await ControlView._refresh_panel(self, _rm, sel_inter.guild)
+                                guild = self.guild or parent_view._resolve_channel_and_guild(_rm)[1]
+                                await parent_view._apply_permissions(_rm, guild)
+                                await parent_view._refresh_panel(_rm, guild)
                             except Exception:
                                 pass
                             await sel_inter.response.edit_message(content=(
@@ -230,7 +342,7 @@ def build_control_view(manager, meta: "RoomMeta") -> discord.ui.View:
                             raise RuntimeError("EMPTY_LIST")
                         options = []
                         for uid in source_ids[:25]:  # Discord Select max 25 options
-                            member = interaction.guild.get_member(uid) if interaction.guild else None
+                            member = self.guild.get_member(uid) if self.guild else None
                             label = member.display_name if isinstance(member, discord.Member) else f"ID {uid}"
                             desc = f"{member.name}" if isinstance(member, discord.Member) else "Utilisateur inconnu"
                             options.append(discord.SelectOption(label=label, value=str(uid), description=desc))
@@ -258,9 +370,9 @@ def build_control_view(manager, meta: "RoomMeta") -> discord.ui.View:
                             else:
                                 _rm.blacklist.difference_update(ids)
                             try:
-                                if sel_inter.guild:
-                                    await ControlView._apply_permissions(self, _rm, sel_inter.guild)  # type: ignore[arg-type]
-                                    await ControlView._refresh_panel(self, _rm, sel_inter.guild)
+                                guild = self.guild or parent_view._resolve_channel_and_guild(_rm)[1]
+                                await parent_view._apply_permissions(_rm, guild)
+                                await parent_view._refresh_panel(_rm, guild)
                             except Exception:
                                 pass
                             await sel_inter.response.edit_message(content=(
@@ -281,6 +393,62 @@ def build_control_view(manager, meta: "RoomMeta") -> discord.ui.View:
                     await interaction.response.send_message("La liste est vide.", ephemeral=True)
                 else:
                     raise
+
+        async def _open_transfer_dialog(self, interaction: discord.Interaction, rm):
+            channel, guild = self._resolve_channel_and_guild(rm)
+            if not isinstance(channel, discord.VoiceChannel) or not isinstance(guild, discord.Guild):
+                await interaction.response.send_message("Canal introuvable", ephemeral=True)
+                return
+
+            candidates = [m for m in channel.members if m.id != rm.creator_id]
+            if not candidates:
+                await interaction.response.send_message("Personne d'autre dans le salon.", ephemeral=True)
+                return
+
+            parent_view = self
+
+            class TransferOwnershipView(discord.ui.View):
+                def __init__(self, *, timeout: Optional[float] = 60):
+                    super().__init__(timeout=timeout)
+                    options: list[discord.SelectOption] = []
+                    for member in candidates[:25]:
+                        label = member.display_name[:100]
+                        desc = f"{member.name}"[:100]
+                        options.append(discord.SelectOption(label=label, value=str(member.id), description=desc))
+                    select = discord.ui.Select(
+                        placeholder="Choisir le nouveau propriétaire",
+                        min_values=1,
+                        max_values=1,
+                        options=options,
+                    )
+
+                    async def on_select(sel_inter: discord.Interaction):
+                        new_owner_id = int(select.values[0])
+                        try:
+                            await manager.transfer_room_ownership(rm, new_owner_id, guild)
+                            await parent_view._refresh_panel(rm, guild)
+                        except Exception:
+                            await sel_inter.response.send_message("Transfert impossible.", ephemeral=True)
+                            return
+                        try:
+                            await sel_inter.response.edit_message(
+                                content=f"Propriété transférée à <@{new_owner_id}>.",
+                                view=None,
+                            )
+                        except Exception:
+                            pass
+
+                    select.callback = on_select  # type: ignore[assignment]
+                    self.add_item(select)
+
+            try:
+                await interaction.response.send_message(
+                    content="Sélectionnez le nouveau propriétaire",
+                    view=TransferOwnershipView(),
+                    ephemeral=True,
+                )
+            except discord.InteractionResponded:
+                await interaction.followup.send("Impossible d'ouvrir la sélection.", ephemeral=True)
 
     return ControlView()
 

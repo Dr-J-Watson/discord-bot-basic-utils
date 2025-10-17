@@ -47,6 +47,149 @@ class VoiceHubsManager:
             self.locks[hub_id] = lock
         return lock
 
+    async def apply_room_permissions(self, meta: RoomMeta, guild: discord.Guild):
+        channel = guild.get_channel(meta.channel_id)
+        if not isinstance(channel, discord.VoiceChannel):
+            return
+
+        reason = f"Voice hub update ({meta.mode})"
+        default_role = guild.default_role
+        base_overwrite = channel.overwrites_for(default_role)
+
+        # Mode-specific permissions for everyone
+        if meta.mode == "open":
+            base_overwrite.connect = True
+            base_overwrite.view_channel = True
+            base_overwrite.speak = None
+        elif meta.mode == "closed":
+            base_overwrite.connect = False
+            base_overwrite.view_channel = True
+            base_overwrite.speak = None
+        elif meta.mode == "private":
+            base_overwrite.connect = False
+            base_overwrite.view_channel = False
+            base_overwrite.speak = None
+        elif meta.mode == "conference":
+            base_overwrite.connect = True
+            base_overwrite.view_channel = True
+            base_overwrite.speak = False
+
+        try:
+            await channel.set_permissions(default_role, overwrite=base_overwrite, reason=reason)
+        except Exception:  # noqa: BLE001
+            logger.exception("Impossible de mettre à jour les permissions par défaut pour %s", channel.id)
+
+        if meta.mode != "conference" and meta.conference_allowed:
+            meta.conference_allowed.clear()
+
+        allowed_ids = {meta.creator_id}
+        allowed_ids.update(meta.whitelist)
+        if meta.mode == "conference":
+            allowed_ids.update(meta.conference_allowed)
+
+        # Ne jamais garder en allowed des utilisateurs blacklistés
+        allowed_ids.difference_update(meta.blacklist)
+
+        tracked_ids = set(allowed_ids) | set(meta.blacklist) | set(meta.conference_allowed)
+        if meta.creator_id:
+            tracked_ids.add(meta.creator_id)
+
+        async def set_member_overwrite(user_id: int, *, connect: Optional[bool] = None, view: Optional[bool] = None, speak: Optional[bool] = None):
+            member = guild.get_member(user_id)
+            if not isinstance(member, discord.Member):
+                return
+            overwrite = channel.overwrites_for(member)
+            if connect is not None:
+                overwrite.connect = connect
+            if view is not None:
+                overwrite.view_channel = view
+            if speak is not None:
+                overwrite.speak = speak
+            try:
+                await channel.set_permissions(member, overwrite=overwrite, reason=reason)
+            except Exception:  # noqa: BLE001
+                logger.debug("Impossible d'appliquer overwrite pour %s sur %s", user_id, channel.id)
+
+        for uid in tracked_ids:
+            if uid in meta.blacklist:
+                await set_member_overwrite(
+                    uid,
+                    connect=False,
+                    view=False if meta.mode == "private" else None,
+                    speak=False,
+                )
+            elif uid in allowed_ids:
+                await set_member_overwrite(
+                    uid,
+                    connect=True,
+                    view=True,
+                    speak=True if meta.mode == "conference" else None,
+                )
+            else:
+                await set_member_overwrite(
+                    uid,
+                    connect=None,
+                    view=None if meta.mode != "private" else False,
+                    speak=None,
+                )
+
+    async def transfer_room_ownership(self, meta: RoomMeta, new_owner_id: int, guild: discord.Guild):
+        channel = guild.get_channel(meta.channel_id)
+        if not isinstance(channel, discord.VoiceChannel):
+            raise RuntimeError("Canal introuvable pour le transfert")
+
+        old_owner_id = meta.creator_id
+        if new_owner_id == old_owner_id:
+            return
+
+        meta.creator_id = new_owner_id
+        meta.blacklist.discard(new_owner_id)
+        if meta.mode == "conference":
+            meta.conference_allowed.add(new_owner_id)
+            if old_owner_id not in meta.whitelist:
+                meta.conference_allowed.discard(old_owner_id)
+
+        await self.apply_room_permissions(meta, guild)
+
+        allow_perms = discord.Permissions()
+        allow_perms.update(
+            manage_channels=True,
+            move_members=True,
+            mute_members=True,
+            deafen_members=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            priority_speaker=True,
+            use_voice_activation=True,
+        )
+
+        new_member = guild.get_member(new_owner_id)
+        if isinstance(new_member, discord.Member):
+            try:
+                overwrite = discord.PermissionOverwrite.from_pair(allow_perms, discord.Permissions.none())
+                await channel.set_permissions(new_member, overwrite=overwrite, reason="Voice hub ownership transfer")
+            except Exception:  # noqa: BLE001
+                logger.exception("Impossible d'appliquer les permissions propriétaire pour %s", new_owner_id)
+
+        if old_owner_id and old_owner_id != new_owner_id:
+            old_member = guild.get_member(old_owner_id)
+            if isinstance(old_member, discord.Member):
+                try:
+                    overwrite = channel.overwrites_for(old_member)
+                    overwrite.manage_channels = None
+                    overwrite.move_members = None
+                    overwrite.mute_members = None
+                    overwrite.deafen_members = None
+                    overwrite.stream = None
+                    overwrite.priority_speaker = None
+                    overwrite.use_voice_activation = None
+                    await channel.set_permissions(old_member, overwrite=overwrite, reason="Voice hub ownership transfer cleanup")
+                except Exception:  # noqa: BLE001
+                    logger.debug("Impossible de nettoyer les permissions de l'ancien propriétaire %s", old_owner_id)
+
+        logger.info("Transfert de propriété du salon %s: %s -> %s", meta.channel_id, old_owner_id, new_owner_id)
+
     # ---------- hubs ----------
     async def add_hub(self, channel: discord.VoiceChannel):
         await db.insert_hub(self.pool, channel.id, channel.guild.id)
@@ -136,6 +279,10 @@ class VoiceHubsManager:
                 await member.move_to(new_channel, reason="Move to dynamic room")
                 meta = RoomMeta(channel_id=new_channel.id, creator_id=member.id, mode="open")
                 self.room_meta[new_channel.id] = meta
+                try:
+                    await self.apply_room_permissions(meta, hub_channel.guild)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Echec application permissions initiales pour %s", new_channel.id)
                 await self._send_control_panel(new_channel, meta, member)
                 logger.info("Dynamic voice créé %s pour hub %s", new_channel.id, hub_id)
             except Exception:  # noqa: BLE001
@@ -147,57 +294,33 @@ class VoiceHubsManager:
 
     async def _send_control_panel(self, voice_channel: discord.VoiceChannel, meta: RoomMeta, creator: discord.Member):
         view = build_control_view(self, meta)
-        # Attempt embed build only if we can locate channel and creator context
-        embed = None
-        channel = voice_channel
-        creator_member = creator
-        if isinstance(channel, discord.VoiceChannel) and creator_member:
-            embed = build_control_embed(meta, channel, creator_member)
-        # 1) Essai direct: envoyer dans le salon vocal (text-in-voice)
+        embed = build_control_embed(meta, voice_channel, creator)
+        
+        send_ok = False
+
+        # Tentative d'envoi dans le salon vocal (text-in-voice)
         try:
             perms = voice_channel.permissions_for(voice_channel.guild.me)  # type: ignore
-            if perms and getattr(perms, "send_messages", True) and embed:
+            if perms and getattr(perms, "send_messages", True):
                 msg = await voice_channel.send(embed=embed, view=view)  # type: ignore[attr-defined]
                 meta.control_message_id = msg.id
                 meta.text_channel_id = voice_channel.id
-                return
+                meta.control_is_dm = False
+                send_ok = True
         except Exception:
-            # Peut ne pas être activé ou permission manquante -> fallback
-            pass
+            logger.debug("Impossible d'envoyer le panneau de contrôle dans le salon vocal %s", voice_channel.id, exc_info=True)
 
-        # 2) Fallback: récupérer le salon ou thread avec le même ID et vérifier l'envoi possible
-        target = None
-        try:
-            candidate = voice_channel.guild.get_channel_or_thread(voice_channel.id)  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001
-            candidate = None
-        if candidate is not None:
+        if not send_ok and isinstance(creator, discord.Member):
             try:
-                perms = candidate.permissions_for(voice_channel.guild.me)  # type: ignore
-                if hasattr(candidate, "send") and perms and perms.send_messages:
-                    target = candidate
-            except Exception:  # noqa: BLE001
-                target = None
-
-        # 3) Dernier recours: premier salon textuel envoyable dans la même catégorie
-        if target is None and voice_channel.category:
-            for ch in voice_channel.category.channels:
-                if isinstance(ch, discord.TextChannel):
-                    try:
-                        if ch.permissions_for(voice_channel.guild.me).send_messages:  # type: ignore
-                            target = ch
-                            break
-                    except Exception:  # noqa: BLE001
-                        continue
-        if target is None:
-            return
-        try:
-            if embed:
-                msg = await target.send(embed=embed, view=view)
+                dm = creator.dm_channel or await creator.create_dm()
+                dm_view = build_control_view(self, meta)
+                msg = await dm.send(embed=embed, view=dm_view)
                 meta.control_message_id = msg.id
-                meta.text_channel_id = target.id
-        except Exception:  # noqa: BLE001
-            logger.exception("Echec envoi panneau contrôle")
+                meta.text_channel_id = dm.id
+                meta.control_is_dm = True
+                send_ok = True
+            except Exception:
+                logger.debug("Impossible d'envoyer le panneau de contrôle en DM pour %s", creator.id, exc_info=True)
 
     async def delete_dynamic_room_if_empty(self, channel: discord.VoiceChannel):
         if channel.id not in self.dynamic_rooms:

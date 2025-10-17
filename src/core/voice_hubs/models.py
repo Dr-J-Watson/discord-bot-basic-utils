@@ -16,8 +16,10 @@ class RoomMeta:
 
     channel_id: int
     creator_id: int
-    mode: str  # 'open' | 'closed' | 'private'
+    mode: str  # 'open' | 'closed' | 'private' | 'conference'
     control_message_id: Optional[int] = None
     text_channel_id: Optional[int] = None
+    control_is_dm: bool = False
     whitelist: Set[int] = field(default_factory=set)
     blacklist: Set[int] = field(default_factory=set)
+    conference_allowed: Set[int] = field(default_factory=set)
