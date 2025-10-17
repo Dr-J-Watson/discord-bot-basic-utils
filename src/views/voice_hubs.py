@@ -242,6 +242,47 @@ def build_control_view(manager, meta: "RoomMeta", *, readonly: bool = False) -> 
                     await interaction.response.send_message("Erreur suppression", ephemeral=True)
             else:
                 await interaction.response.send_message("Canal introuvable", ephemeral=True)
+        
+        
+        @discord.ui.button(label="Help", style=discord.ButtonStyle.secondary, row=3)
+        async def show_help(self, interaction: discord.Interaction, button: discord.ui.Button):  # type: ignore
+            rm = manager.room_meta.get(meta.channel_id)
+            if not rm:
+                await interaction.response.send_message("Meta introuvable", ephemeral=True)
+                return
+            help_embed = discord.Embed(
+                title="Panneau Voice Hub — Aide",
+                color=discord.Color.blurple(),
+                description="Guide rapide de chaque bouton. Les règles de purge changent selon le mode actif.",
+            )
+            help_embed.add_field(
+                name="Modes",
+                value=(
+                    "**Ouvert** — Tout le monde peut entrer ; purge exclut seulement la blacklist.\n"
+                    "**Fermé** — Accès limité au créateur et à la whitelist ; purge renvoie les autres.\n"
+                    "**Privé** — Salon masqué et verrouillé hors whitelist ; purge expulse les visiteurs non autorisés.\n"
+                    "**Conférence** — Fige les présents ; purge chasse ceux hors liste conférence/whitelist."
+                ),
+                inline=False,
+            )
+            help_embed.add_field(
+                name="Gestion des accès",
+                value=(
+                    "**WL + / WL -** — Ajoute ou retire de la whitelist, donne la priorité d'accès.\n"
+                    "**BL + / BL -** — Ajoute ou retire de la blacklist, bloque complètement."
+                ),
+                inline=False,
+            )
+            help_embed.add_field(
+                name="Actions",
+                value=(
+                    "**Purger** — Applique les règles du mode pour éjecter les membres non éligibles.\n"
+                    "**Transférer** — Donne la propriété du salon à un membre présent.\n"
+                    "**Supprimer** — Ferme immédiatement le salon dynamique."
+                ),
+                inline=False,
+            )
+            await interaction.response.send_message(embed=help_embed, ephemeral=True)
 
         async def _set_mode(self, interaction: discord.Interaction, new_mode: str):
             rm = manager.room_meta.get(meta.channel_id)
